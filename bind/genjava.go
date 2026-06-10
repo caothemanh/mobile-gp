@@ -1003,7 +1003,7 @@ func (g *JavaGen) javaPkgName(pkg *types.Package) string {
 // instead.
 func JavaPkgName(pkgPrefix string, pkg *types.Package) string {
 	if pkg == nil {
-		return "go"
+		return "gp"
 	}
 	s := javaNameReplacer(pkg.Name())
 	if pkgPrefix == "" {
