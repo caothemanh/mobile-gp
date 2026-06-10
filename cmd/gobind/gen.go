@@ -92,7 +92,7 @@ func genPkg(lang string, p *types.Package, astFiles []*ast.File, allPkg []*types
 					errorf("failed to open Java support file: %v", err)
 				}
 				defer in.Close()
-				w, closer := writer(filepath.Join("java", "go", javaFile))
+				w, closer := writer(filepath.Join("java", "gp", javaFile))
 				defer closer()
 				if _, err := io.Copy(w, in); err != nil {
 					errorf("failed to copy Java support file: %v", err)
