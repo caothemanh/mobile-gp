@@ -1007,7 +1007,7 @@ func JavaPkgName(pkgPrefix string, pkg *types.Package) string {
 	}
 	s := javaNameReplacer(pkg.Name())
 	if pkgPrefix == "" {
-		return s
+		return "gp"
 	}
 	return pkgPrefix + "." + s
 }
