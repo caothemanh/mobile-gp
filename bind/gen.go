@@ -1,8 +1,8 @@
-// Copyright 2015 The Go Authors. All rights reserved.
+// Copyright 2014 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package bind
+package main
 
 import (
 	"bytes"
@@ -11,555 +11,381 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"regexp"
+	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/mobile/bind"
+	"golang.org/x/mobile/internal/importers"
+	"golang.org/x/mobile/internal/importers/java"
+	"golang.org/x/mobile/internal/importers/objc"
+	"golang.org/x/tools/go/packages"
 )
 
-type (
-	ErrorList []error
-
-	// varMode describes the lifetime of an argument or
-	// return value. Modes are used to guide the conversion
-	// of string and byte slice values across the language
-	// barrier. The same conversion mode must be used for
-	// both the conversion before a foreign call and the
-	// corresponding conversion after the call.
-	// See the mode* constants for a description of
-	// each mode.
-	varMode int
-)
-
-const (
-	// modeTransient are for function arguments that
-	// are not used after the function returns.
-	// Transient byte slices don't need copying
-	// when passed across the language barrier.
-	modeTransient varMode = iota
-	// modeRetained are for returned values and for function
-	// arguments that are used after the function returns.
-	// Retained byte slices need an intermediate copy.
-	modeRetained
-)
-
-func (list ErrorList) Error() string {
-	buf := new(bytes.Buffer)
-	for i, err := range list {
-		if i > 0 {
-			buf.WriteRune('\n')
-		}
-		io.WriteString(buf, err.Error())
+func genPkg(lang string, p *types.Package, astFiles []*ast.File, allPkg []*types.Package, classes []*java.Class, otypes []*objc.Named) {
+	fname := defaultFileName(lang, p)
+	conf := &bind.GeneratorConfig{
+		Fset:   fset,
+		Pkg:    p,
+		AllPkg: allPkg,
 	}
-	return buf.String()
-}
-
-// interfaceInfo comes from Init and collects the auxiliary information
-// needed to generate bindings for an exported Go interface in a bound
-// package.
-type interfaceInfo struct {
-	obj     *types.TypeName
-	t       *types.Interface
-	summary ifaceSummary
-}
-
-// structInfo comes from Init and collects the auxiliary information
-// needed to generate bindings for an exported Go struct in a bound
-// package.
-type structInfo struct {
-	obj *types.TypeName
-	t   *types.Struct
-}
-
-// Generator contains the common Go package information
-// needed for the specific Go, Java, ObjC generators.
-//
-// After setting Printer, Fset, AllPkg, Pkg, the Init
-// method is used to initialize the auxiliary information
-// about the package to be generated, Pkg.
-type Generator struct {
-	*Printer
-	Fset   *token.FileSet
-	AllPkg []*types.Package
-	Files  []*ast.File
-	Pkg    *types.Package
-	err    ErrorList
-
-	// fields set by init.
-	pkgName   string
-	pkgPrefix string
-	funcs     []*types.Func
-	constants []*types.Const
-	vars      []*types.Var
-
-	interfaces []interfaceInfo
-	structs    []structInfo
-	otherNames []*types.TypeName
-	// allIntf contains interfaces from all bound packages.
-	allIntf []interfaceInfo
-
-	docs pkgDocs
-}
-
-// A pkgDocs maps the name of each exported package-level declaration to its extracted documentation.
-type pkgDocs map[string]*pkgDoc
-
-type pkgDoc struct {
-	doc string
-	// Struct or interface fields and methods.
-	members map[string]string
-}
-
-// pkgPrefix returns a prefix that disambiguates symbol names for binding
-// multiple packages.
-//
-// TODO(elias.naur): Avoid (and test) name clashes from multiple packages
-// with the same name. Perhaps use the index from the order the package is
-// generated.
-func pkgPrefix(pkg *types.Package) string {
-	// The error type has no package
-	if pkg == nil {
-		return ""
-	}
-	return pkg.Name()
-}
-
-func (g *Generator) Init() {
-	if g.Pkg != nil {
-		g.pkgName = g.Pkg.Name()
-	}
-	g.pkgPrefix = pkgPrefix(g.Pkg)
-
-	if g.Pkg != nil {
-		g.parseDocs()
-		scope := g.Pkg.Scope()
-		hasExported := false
-		for _, name := range scope.Names() {
-			obj := scope.Lookup(name)
-			if !obj.Exported() {
-				continue
-			}
-			hasExported = true
-			switch obj := obj.(type) {
-			case *types.Func:
-				if isCallable(obj) {
-					g.funcs = append(g.funcs, obj)
-				}
-			case *types.TypeName:
-				named, ok := obj.Type().(*types.Named)
-				if !ok {
-					continue
-				}
-				switch t := named.Underlying().(type) {
-				case *types.Struct:
-					g.structs = append(g.structs, structInfo{obj, t})
-				case *types.Interface:
-					g.interfaces = append(g.interfaces, interfaceInfo{obj, t, makeIfaceSummary(t)})
-				default:
-					g.otherNames = append(g.otherNames, obj)
-				}
-			case *types.Const:
-				g.constants = append(g.constants, obj)
-			case *types.Var:
-				g.vars = append(g.vars, obj)
-			default:
-				g.errorf("unsupported exported type for %s: %T", obj.Name(), obj)
-			}
-		}
-		if !hasExported {
-			g.errorf("no exported names in the package %q", g.Pkg.Path())
-		}
+	var pname string
+	if p != nil {
+		pname = p.Name()
 	} else {
-		// Bind the single supported type from the universe scope, error.
-		errType := types.Universe.Lookup("error").(*types.TypeName)
-		t := errType.Type().Underlying().(*types.Interface)
-		g.interfaces = append(g.interfaces, interfaceInfo{errType, t, makeIfaceSummary(t)})
+		pname = "universe"
 	}
-	for _, p := range g.AllPkg {
-		scope := p.Scope()
-		for _, name := range scope.Names() {
-			obj := scope.Lookup(name)
-			if !obj.Exported() {
-				continue
+	var buf bytes.Buffer
+	generator := &bind.Generator{
+		Printer: &bind.Printer{Buf: &buf, IndentEach: []byte("\t")},
+		Fset:    conf.Fset,
+		AllPkg:  conf.AllPkg,
+		Pkg:     conf.Pkg,
+		Files:   astFiles,
+	}
+	switch lang {
+	case "java":
+		g := &bind.JavaGen{
+			JavaPkg:   *javaPkg,
+			Generator: generator,
+		}
+		g.Init(classes)
+
+		pkgname := bind.JavaPkgName(*javaPkg, p)
+		pkgDir := strings.Replace(pkgname, ".", "/", -1)
+		buf.Reset()
+		w, closer := writer(filepath.Join("java", pkgDir, fname))
+		processErr(g.GenJava())
+		io.Copy(w, &buf)
+		closer()
+		for i, name := range g.ClassNames() {
+			buf.Reset()
+			w, closer := writer(filepath.Join("java", pkgDir, name+".java"))
+			processErr(g.GenClass(i))
+			io.Copy(w, &buf)
+			closer()
+		}
+		buf.Reset()
+		w, closer = writer(filepath.Join("src", "gobind", pname+"_android.c"))
+		processErr(g.GenC())
+		io.Copy(w, &buf)
+		closer()
+		buf.Reset()
+		w, closer = writer(filepath.Join("src", "gobind", pname+"_android.h"))
+		processErr(g.GenH())
+		io.Copy(w, &buf)
+		closer()
+		// Generate support files along with the universe package
+		if p == nil {
+			dir, err := packageDir("golang.org/x/mobile/bind")
+			if err != nil {
+				errorf(`"golang.org/x/mobile/bind" is not found; run go get golang.org/x/mobile/bind: %v`, err)
+				return
 			}
-			if obj, ok := obj.(*types.TypeName); ok {
-				named, ok := obj.Type().(*types.Named)
-				if !ok {
-					continue
+			repo := filepath.Clean(filepath.Join(dir, "..")) // golang.org/x/mobile directory.
+			for _, javaFile := range []string{"Seq.java"} {
+				src := filepath.Join(repo, "bind/java/"+javaFile)
+				in, err := os.Open(src)
+				if err != nil {
+					errorf("failed to open Java support file: %v", err)
 				}
-				if t, ok := named.Underlying().(*types.Interface); ok {
-					g.allIntf = append(g.allIntf, interfaceInfo{obj, t, makeIfaceSummary(t)})
-				}
-			}
-		}
-	}
-}
-
-// parseDocs extracts documentation from a package in a form useful for lookups.
-func (g *Generator) parseDocs() {
-	d := make(pkgDocs)
-	for _, f := range g.Files {
-		for _, decl := range f.Decls {
-			switch decl := decl.(type) {
-			case *ast.GenDecl:
-				for _, spec := range decl.Specs {
-					switch spec := spec.(type) {
-					case *ast.TypeSpec:
-						d.addType(spec, decl.Doc)
-					case *ast.ValueSpec:
-						d.addValue(spec, decl.Doc)
-					}
-				}
-			case *ast.FuncDecl:
-				d.addFunc(decl)
-			}
-		}
-	}
-	g.docs = d
-}
-
-func (d pkgDocs) addValue(t *ast.ValueSpec, outerDoc *ast.CommentGroup) {
-	for _, n := range t.Names {
-		if !ast.IsExported(n.Name) {
-			continue
-		}
-		doc := t.Doc
-		if doc == nil {
-			doc = outerDoc
-		}
-		if doc != nil {
-			d[n.Name] = &pkgDoc{doc: doc.Text()}
-		}
-	}
-}
-
-func (d pkgDocs) addFunc(f *ast.FuncDecl) {
-	doc := f.Doc
-	if doc == nil {
-		return
-	}
-	fn := f.Name.Name
-	if !ast.IsExported(fn) {
-		return
-	}
-	if r := f.Recv; r != nil {
-		// f is a method.
-		n := typeName(r.List[0].Type)
-		pd, exists := d[n]
-		if !exists {
-			pd = &pkgDoc{members: make(map[string]string)}
-			d[n] = pd
-		}
-		pd.members[fn] = doc.Text()
-	} else {
-		// f is a function.
-		d[fn] = &pkgDoc{doc: doc.Text()}
-	}
-}
-
-func (d pkgDocs) addType(t *ast.TypeSpec, outerDoc *ast.CommentGroup) {
-	if !ast.IsExported(t.Name.Name) {
-		return
-	}
-	doc := t.Doc
-	if doc == nil {
-		doc = outerDoc
-	}
-	pd := d[t.Name.Name]
-	pd = &pkgDoc{members: make(map[string]string)}
-	d[t.Name.Name] = pd
-	if doc != nil {
-		pd.doc = doc.Text()
-	}
-	var fields *ast.FieldList
-	switch t := t.Type.(type) {
-	case *ast.StructType:
-		fields = t.Fields
-	case *ast.InterfaceType:
-		fields = t.Methods
-	}
-	if fields != nil {
-		for _, field := range fields.List {
-			if field.Doc != nil {
-				if field.Names == nil {
-					// Anonymous field. Extract name from its type.
-					if n := typeName(field.Type); ast.IsExported(n) {
-						pd.members[n] = field.Doc.Text()
-					}
-				}
-				for _, n := range field.Names {
-					if ast.IsExported(n.Name) {
-						pd.members[n.Name] = field.Doc.Text()
-					}
+				defer in.Close()
+				w, closer := writer(filepath.Join("java", "gp", javaFile))
+				defer closer()
+				if _, err := io.Copy(w, in); err != nil {
+					errorf("failed to copy Java support file: %v", err)
+					return
 				}
 			}
+			// Copy support files
+			if err != nil {
+				errorf("unable to import bind/java: %v", err)
+				return
+			}
+			javaDir, err := packageDir("golang.org/x/mobile/bind/java")
+			if err != nil {
+				errorf("unable to import bind/java: %v", err)
+				return
+			}
+			copyFile(filepath.Join("src", "gobind", "seq_android.c"), filepath.Join(javaDir, "seq_android.c.support"))
+			copyFile(filepath.Join("src", "gobind", "seq_android.go"), filepath.Join(javaDir, "seq_android.go.support"))
+			copyFile(filepath.Join("src", "gobind", "seq_android.h"), filepath.Join(javaDir, "seq_android.h"))
 		}
-	}
-}
-
-// typeName returns the type name T for expressions on the
-// T, *T, **T (etc.) form.
-func typeName(t ast.Expr) string {
-	switch t := t.(type) {
-	case *ast.StarExpr:
-		return typeName(t.X)
-	case *ast.Ident:
-		return t.Name
-	case *ast.SelectorExpr:
-		return t.Sel.Name
+	case "go":
+		w, closer := writer(filepath.Join("src", "gobind", fname))
+		conf.Writer = w
+		processErr(bind.GenGo(conf))
+		closer()
+		w, closer = writer(filepath.Join("src", "gobind", pname+".h"))
+		genPkgH(w, pname)
+		io.Copy(w, &buf)
+		closer()
+		w, closer = writer(filepath.Join("src", "gobind", "seq.h"))
+		genPkgH(w, "seq")
+		io.Copy(w, &buf)
+		closer()
+		dir, err := packageDir("golang.org/x/mobile/bind")
+		if err != nil {
+			errorf("unable to import bind: %v", err)
+			return
+		}
+		copyFile(filepath.Join("src", "gobind", "seq.go"), filepath.Join(dir, "seq.go.support"))
+	case "objc":
+		g := &bind.ObjcGen{
+			Generator: generator,
+			Prefix:    *prefix,
+		}
+		g.Init(otypes)
+		w, closer := writer(filepath.Join("src", "gobind", pname+"_darwin.h"))
+		processErr(g.GenGoH())
+		io.Copy(w, &buf)
+		closer()
+		hname := strings.Title(fname[:len(fname)-2]) + ".objc.h"
+		w, closer = writer(filepath.Join("src", "gobind", hname))
+		processErr(g.GenH())
+		io.Copy(w, &buf)
+		closer()
+		mname := strings.Title(fname[:len(fname)-2]) + "_darwin.m"
+		w, closer = writer(filepath.Join("src", "gobind", mname))
+		conf.Writer = w
+		processErr(g.GenM())
+		io.Copy(w, &buf)
+		closer()
+		if p == nil {
+			// Copy support files
+			dir, err := packageDir("golang.org/x/mobile/bind/objc")
+			if err != nil {
+				errorf("unable to import bind/objc: %v", err)
+				return
+			}
+			copyFile(filepath.Join("src", "gobind", "seq_darwin.m"), filepath.Join(dir, "seq_darwin.m.support"))
+			copyFile(filepath.Join("src", "gobind", "seq_darwin.go"), filepath.Join(dir, "seq_darwin.go.support"))
+			copyFile(filepath.Join("src", "gobind", "ref.h"), filepath.Join(dir, "ref.h"))
+			copyFile(filepath.Join("src", "gobind", "seq_darwin.h"), filepath.Join(dir, "seq_darwin.h"))
+		}
 	default:
-		return ""
+		errorf("unknown target language: %q", lang)
 	}
 }
 
-func (d *pkgDoc) Doc() string {
-	if d == nil {
-		return ""
-	}
-	return d.doc
+func genPkgH(w io.Writer, pname string) {
+	fmt.Fprintf(w, `// Code generated by gobind. DO NOT EDIT.
+
+#ifdef __GOBIND_ANDROID__
+#include "%[1]s_android.h"
+#endif
+#ifdef __GOBIND_DARWIN__
+#include "%[1]s_darwin.h"
+#endif`, pname)
 }
 
-func (d *pkgDoc) Member(n string) string {
-	if d == nil {
-		return ""
+func genObjcPackages(dir string, types []*objc.Named, embedders []importers.Struct) error {
+	var buf bytes.Buffer
+	cg := &bind.ObjcWrapper{
+		Printer: &bind.Printer{
+			IndentEach: []byte("\t"),
+			Buf:        &buf,
+		},
 	}
-	return d.members[n]
-}
-
-// constructorType returns the type T for a function of the forms:
-//
-// func NewT...(...) *T
-// func NewT...(...) (*T, error)
-func (g *Generator) constructorType(f *types.Func) *types.TypeName {
-	sig := f.Type().(*types.Signature)
-	res := sig.Results()
-	if res.Len() != 1 && !(res.Len() == 2 && isErrorType(res.At(1).Type())) {
-		return nil
+	var genNames []string
+	for _, emb := range embedders {
+		genNames = append(genNames, emb.Name)
 	}
-	rt := res.At(0).Type()
-	pt, ok := rt.(*types.Pointer)
-	if !ok {
-		return nil
-	}
-	nt, ok := pt.Elem().(*types.Named)
-	if !ok {
-		return nil
-	}
-	obj := nt.Obj()
-	if !strings.HasPrefix(f.Name(), "New"+obj.Name()) {
-		return nil
-	}
-	return obj
-}
-
-func toCFlag(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
-}
-
-func (g *Generator) errorf(format string, args ...interface{}) {
-	g.err = append(g.err, fmt.Errorf(format, args...))
-}
-
-// cgoType returns the name of a Cgo type suitable for converting a value of
-// the given type.
-func (g *Generator) cgoType(t types.Type) string {
-	switch t := types.Unalias(t).(type) {
-	case *types.Basic:
-		switch t.Kind() {
-		case types.Bool, types.UntypedBool:
-			return "char"
-		case types.Int:
-			return "nint"
-		case types.Int8:
-			return "int8_t"
-		case types.Int16:
-			return "int16_t"
-		case types.Int32, types.UntypedRune: // types.Rune
-			return "int32_t"
-		case types.Int64, types.UntypedInt:
-			return "int64_t"
-		case types.Uint8: // types.Byte
-			return "uint8_t"
-		// TODO(crawshaw): case types.Uint, types.Uint16, types.Uint32, types.Uint64:
-		case types.Float32:
-			return "float"
-		case types.Float64, types.UntypedFloat:
-			return "double"
-		case types.String:
-			return "nstring"
-		default:
-			g.errorf("unsupported basic type: %s", t)
+	cg.Init(types, genNames)
+	for i, opkg := range cg.Packages() {
+		pkgDir := filepath.Join(dir, "src", "ObjC", opkg)
+		if err := os.MkdirAll(pkgDir, 0700); err != nil {
+			return err
 		}
-	case *types.Slice:
-		if isBytesSlice(t) {
-			return "nbyteslice"
+		pkgFile := filepath.Join(pkgDir, "package.go")
+		buf.Reset()
+		cg.GenPackage(i)
+		if err := os.WriteFile(pkgFile, buf.Bytes(), 0600); err != nil {
+			return err
 		}
-		g.errorf("unsupported slice type: %s", t)
-	case *types.Pointer:
-		if _, ok := types.Unalias(t.Elem()).(*types.Named); ok {
-			return g.cgoType(t.Elem())
-		}
-		g.errorf("unsupported pointer to type: %s", t)
-	case *types.Named:
-		return "int32_t"
-	default:
-		g.errorf("unsupported type: %s", t)
 	}
-	return "TODO"
+	buf.Reset()
+	cg.GenInterfaces()
+	objcBase := filepath.Join(dir, "src", "ObjC")
+	if err := os.MkdirAll(objcBase, 0700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(objcBase, "interfaces.go"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	goBase := filepath.Join(dir, "src", "gobind")
+	if err := os.MkdirAll(goBase, 0700); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenGo()
+	if err := os.WriteFile(filepath.Join(goBase, "interfaces_darwin.go"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenH()
+	if err := os.WriteFile(filepath.Join(goBase, "interfaces.h"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenM()
+	if err := os.WriteFile(filepath.Join(goBase, "interfaces_darwin.m"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (g *Generator) genInterfaceMethodSignature(m *types.Func, iName string, header bool, g_paramName func(*types.Tuple, int) string) {
-	sig := m.Type().(*types.Signature)
-	params := sig.Params()
-	res := sig.Results()
+func genJavaPackages(dir string, classes []*java.Class, embedders []importers.Struct) error {
+	var buf bytes.Buffer
+	cg := &bind.ClassGen{
+		JavaPkg: *javaPkg,
+		Printer: &bind.Printer{
+			IndentEach: []byte("\t"),
+			Buf:        &buf,
+		},
+	}
+	cg.Init(classes, embedders)
+	for i, jpkg := range cg.Packages() {
+		pkgDir := filepath.Join(dir, "src", "Java", jpkg)
+		if err := os.MkdirAll(pkgDir, 0700); err != nil {
+			return err
+		}
+		pkgFile := filepath.Join(pkgDir, "package.go")
+		buf.Reset()
+		cg.GenPackage(i)
+		if err := os.WriteFile(pkgFile, buf.Bytes(), 0600); err != nil {
+			return err
+		}
+	}
+	buf.Reset()
+	cg.GenInterfaces()
+	javaBase := filepath.Join(dir, "src", "Java")
+	if err := os.MkdirAll(javaBase, 0700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(javaBase, "interfaces.go"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	goBase := filepath.Join(dir, "src", "gobind")
+	if err := os.MkdirAll(goBase, 0700); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenGo()
+	if err := os.WriteFile(filepath.Join(goBase, "classes_android.go"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenH()
+	if err := os.WriteFile(filepath.Join(goBase, "classes.h"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	buf.Reset()
+	cg.GenC()
+	if err := os.WriteFile(filepath.Join(goBase, "classes_android.c"), buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	return nil
+}
 
-	if res.Len() == 0 {
-		g.Printf("void ")
-	} else {
-		if res.Len() == 1 {
-			g.Printf("%s ", g.cgoType(res.At(0).Type()))
+func processErr(err error) {
+	if err != nil {
+		if list, _ := err.(bind.ErrorList); len(list) > 0 {
+			for _, err := range list {
+				errorf("%v", err)
+			}
 		} else {
-			if header {
-				g.Printf("typedef struct cproxy%s_%s_%s_return {\n", g.pkgPrefix, iName, m.Name())
-				g.Indent()
-				for i := 0; i < res.Len(); i++ {
-					t := res.At(i).Type()
-					g.Printf("%s r%d;\n", g.cgoType(t), i)
-				}
-				g.Outdent()
-				g.Printf("} cproxy%s_%s_%s_return;\n", g.pkgPrefix, iName, m.Name())
-			}
-			g.Printf("struct cproxy%s_%s_%s_return ", g.pkgPrefix, iName, m.Name())
+			errorf("%v", err)
 		}
-	}
-	g.Printf("cproxy%s_%s_%s(int32_t refnum", g.pkgPrefix, iName, m.Name())
-	for i := 0; i < params.Len(); i++ {
-		t := params.At(i).Type()
-		g.Printf(", %s %s", g.cgoType(t), g_paramName(params, i))
-	}
-	g.Printf(")")
-	if header {
-		g.Printf(";\n")
-	} else {
-		g.Printf(" {\n")
 	}
 }
 
-func (g *Generator) validPkg(pkg *types.Package) bool {
-	for _, p := range g.AllPkg {
-		if p == pkg {
-			return true
+var fset = token.NewFileSet()
+
+func writer(fname string) (w io.Writer, closer func()) {
+	if *outdir == "" {
+		return os.Stdout, func() { return }
+	}
+
+	name := filepath.Join(*outdir, fname)
+	dir := filepath.Dir(name)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		errorf("invalid output dir: %v", err)
+		os.Exit(exitStatus)
+	}
+
+	f, err := os.Create(name)
+	if err != nil {
+		errorf("invalid output dir: %v", err)
+		os.Exit(exitStatus)
+	}
+	closer = func() {
+		if err := f.Close(); err != nil {
+			errorf("error in closing output file: %v", err)
 		}
 	}
-	return false
+	return f, closer
 }
 
-// isSigSupported reports whether the generators can handle a given
-// function signature.
-func (g *Generator) isSigSupported(t types.Type) bool {
-	sig := t.(*types.Signature)
-	params := sig.Params()
-	for i := 0; i < params.Len(); i++ {
-		if !g.isSupported(params.At(i).Type()) {
-			return false
-		}
+func copyFile(dst, src string) {
+	w, closer := writer(dst)
+	f, err := os.Open(src)
+	if err != nil {
+		errorf("unable to open file: %v", err)
+		closer()
+		os.Exit(exitStatus)
 	}
-	res := sig.Results()
-	for i := 0; i < res.Len(); i++ {
-		if !g.isSupported(res.At(i).Type()) {
-			return false
-		}
+	if _, err := io.Copy(w, f); err != nil {
+		errorf("unable to copy file: %v", err)
+		f.Close()
+		closer()
+		os.Exit(exitStatus)
 	}
-	return true
+	f.Close()
+	closer()
 }
 
-// isSupported reports whether the generators can handle the type.
-func (g *Generator) isSupported(t types.Type) bool {
-	if isErrorType(t) || isWrapperType(t) {
-		return true
+func defaultFileName(lang string, pkg *types.Package) string {
+	switch lang {
+	case "java":
+		if pkg == nil {
+			return "Universe.java"
+		}
+		firstRune, size := utf8.DecodeRuneInString(pkg.Name())
+		className := string(unicode.ToUpper(firstRune)) + pkg.Name()[size:]
+		return className + ".java"
+	case "go":
+		if pkg == nil {
+			return "go_main.go"
+		}
+		return "go_" + pkg.Name() + "main.go"
+	case "objc":
+		if pkg == nil {
+			return "Universe.m"
+		}
+		firstRune, size := utf8.DecodeRuneInString(pkg.Name())
+		className := string(unicode.ToUpper(firstRune)) + pkg.Name()[size:]
+		return *prefix + className + ".m"
 	}
-	switch t := types.Unalias(t).(type) {
-	case *types.Basic:
-		switch t.Kind() {
-		case types.Bool, types.UntypedBool,
-			types.Int,
-			types.Int8, types.Uint8, // types.Byte
-			types.Int16,
-			types.Int32, types.UntypedRune, // types.Rune
-			types.Int64, types.UntypedInt,
-			types.Float32,
-			types.Float64, types.UntypedFloat,
-			types.String, types.UntypedString:
-			return true
-		}
-		return false
-	case *types.Slice:
-		return isBytesSlice(t)
-	case *types.Pointer:
-		switch t := types.Unalias(t.Elem()).(type) {
-		case *types.Named:
-			return g.validPkg(t.Obj().Pkg())
-		}
-	case *types.Named:
-		switch t.Underlying().(type) {
-		case *types.Interface, *types.Pointer:
-			return g.validPkg(t.Obj().Pkg())
-		}
-	}
-	return false
+	errorf("unknown target language: %q", lang)
+	os.Exit(exitStatus)
+	return ""
 }
 
-var paramRE = regexp.MustCompile(`^p[0-9]*$`)
-
-// basicParamName replaces incompatible name with a p0-pN name.
-// Missing names, or existing names of the form p[0-9] are incompatible.
-func basicParamName(params *types.Tuple, pos int) string {
-	name := params.At(pos).Name()
-	if name == "" || name[0] == '_' || paramRE.MatchString(name) {
-		name = fmt.Sprintf("p%d", pos)
+func packageDir(path string) (string, error) {
+	mode := packages.NeedFiles
+	pkgs, err := packages.Load(&packages.Config{Mode: mode}, path)
+	if err != nil {
+		return "", err
 	}
-	return name
-}
-
-func lowerFirst(s string) string {
-	if s == "" {
-		return ""
+	if len(pkgs) == 0 || len(pkgs[0].GoFiles) == 0 {
+		return "", fmt.Errorf("no Go package in %v", path)
 	}
-
-	var conv []rune
-	for len(s) > 0 {
-		r, n := utf8.DecodeRuneInString(s)
-		if !unicode.IsUpper(r) {
-			if l := len(conv); l > 1 {
-				conv[l-1] = unicode.ToUpper(conv[l-1])
-			}
-			return string(conv) + s
-		}
-		conv = append(conv, unicode.ToLower(r))
-		s = s[n:]
+	pkg := pkgs[0]
+	if len(pkg.Errors) > 0 {
+		return "", fmt.Errorf("%v", pkg.Errors)
 	}
-	return string(conv)
-}
-
-// newNameSanitizer returns a functions that replaces all dashes and dots
-// with underscores, as well as avoiding reserved words by suffixing such
-// identifiers with underscores.
-func newNameSanitizer(res []string) func(s string) string {
-	reserved := make(map[string]bool)
-	for _, word := range res {
-		reserved[word] = true
-	}
-	symbols := strings.NewReplacer(
-		"-", "_",
-		".", "_",
-	)
-	return func(s string) string {
-		if reserved[s] {
-			return s + "_"
-		}
-		return symbols.Replace(s)
-	}
+	return filepath.Dir(pkg.GoFiles[0]), nil
 }
